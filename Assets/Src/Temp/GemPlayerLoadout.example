@@ -1,0 +1,477 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using Unity.Collections;
+using Unity.Entities;
+using UnityEngine;
+using UnityEditor;
+using UnityEditor.SceneManagement;
+using UnityEngine.SceneManagement;
+using Foundations.Components.Common;
+using Foundations.Abilities.Modular.Revamp;
+using Foundations.Movement;
+
+namespace Foundations.Editor
+{
+    public sealed class GemPlayerLoadoutEditor : EditorWindow
+    {
+        private sealed class SlotState
+        {
+            public ActiveSkillGem ActiveSkill;
+            public readonly List<SupportGem> Supports = new List<SupportGem>();
+        }
+
+        private readonly List<SlotState> slots = new List<SlotState>();
+        private readonly Dictionary<int, ActiveSkillGem> activeById = new Dictionary<int, ActiveSkillGem>();
+        private readonly Dictionary<int, SupportGem> supportById = new Dictionary<int, SupportGem>();
+
+        private GemLoadoutBridgeAuthoring bridge;
+        private int activeSlot;
+        private Vector2 scroll;
+
+        [MenuItem("Foundations/Ability System/Player Loadout Manager")]
+        public static void ShowWindow()
+        {
+            var window = GetWindow<GemPlayerLoadoutEditor>("Player Loadout");
+            window.minSize = new Vector2(680f, 420f);
+        }
+
+        private void OnEnable()
+        {
+            EnsureSlotCount();
+            RefreshGemDatabase();
+            TryAutoBindBridge();
+            if (!PullFromBridge() && EditorApplication.isPlaying)
+                PullFromRuntimePlayer();
+        }
+
+        private void OnHierarchyChange()
+        {
+            if (bridge == null)
+                TryAutoBindBridge();
+        }
+
+        private void OnGUI()
+        {
+            DrawToolbar();
+            DrawBridgeRow();
+            DrawActionButtons();
+            DrawStatus();
+
+            EditorGUILayout.Space(8f);
+            DrawLoadoutEditor();
+        }
+
+        private void DrawToolbar()
+        {
+            EditorGUILayout.BeginHorizontal(EditorStyles.toolbar);
+            GUILayout.Label("Gem Player Loadout Manager", EditorStyles.boldLabel);
+            GUILayout.FlexibleSpace();
+            if (GUILayout.Button("Refresh Gems", EditorStyles.toolbarButton))
+                RefreshGemDatabase();
+            if (GUILayout.Button("Find Bridge", EditorStyles.toolbarButton))
+                TryAutoBindBridge();
+            EditorGUILayout.EndHorizontal();
+        }
+
+        private void DrawBridgeRow()
+        {
+            EditorGUILayout.BeginHorizontal();
+            var newBridge = (GemLoadoutBridgeAuthoring)EditorGUILayout.ObjectField("Loadout Bridge", bridge, typeof(GemLoadoutBridgeAuthoring), true);
+            if (newBridge != bridge)
+            {
+                bridge = newBridge;
+                if (bridge != null)
+                    PullFromBridge();
+            }
+
+            if (GUILayout.Button("Create Bridge In Scene", GUILayout.Width(170f)))
+            {
+                CreateBridgeInActiveScene();
+            }
+            EditorGUILayout.EndHorizontal();
+        }
+
+        private void DrawActionButtons()
+        {
+            EditorGUILayout.BeginHorizontal();
+            if (GUILayout.Button("Pull From Bridge"))
+                PullFromBridge();
+            if (GUILayout.Button("Pull From Runtime Player"))
+                PullFromRuntimePlayer();
+            if (GUILayout.Button("Apply To Bridge (Persist)"))
+                ApplyToBridge();
+            using (new EditorGUI.DisabledScope(!EditorApplication.isPlaying))
+            {
+                if (GUILayout.Button("Apply To Runtime Player"))
+                    ApplyToRuntimePlayer();
+            }
+            EditorGUILayout.EndHorizontal();
+        }
+
+        private void DrawStatus()
+        {
+            var playText = EditorApplication.isPlaying ? "Play Mode: ON" : "Play Mode: OFF";
+            var bridgeText = bridge != null ? $"Bridge: {bridge.gameObject.name}" : "Bridge: (none)";
+            var mobilitySkill = slots.Count > GemLoadoutConstants.MobilitySlotIndex ? slots[GemLoadoutConstants.MobilitySlotIndex].ActiveSkill : null;
+            var mobilityName = mobilitySkill != null ? ResolveSkillLabel(mobilitySkill) : "(none)";
+            EditorGUILayout.HelpBox($"{playText} | {bridgeText} | Space Mobility: {mobilityName}", MessageType.None);
+        }
+
+        private void DrawLoadoutEditor()
+        {
+            EnsureSlotCount();
+            activeSlot = EditorGUILayout.IntSlider("Active Slot (QWERT)", activeSlot, 0, GemLoadoutConstants.ActiveSlotCount - 1);
+
+            scroll = EditorGUILayout.BeginScrollView(scroll);
+            for (var i = 0; i < slots.Count; i++)
+            {
+                var isMobilitySlot = i == GemLoadoutConstants.MobilitySlotIndex;
+                EditorGUILayout.BeginVertical("box");
+                EditorGUILayout.LabelField(isMobilitySlot ? "Slot 5 (Space - Mobility)" : $"Slot {i}", EditorStyles.boldLabel);
+
+                var selected = (ActiveSkillGem)EditorGUILayout.ObjectField("Active Skill", slots[i].ActiveSkill, typeof(ActiveSkillGem), false);
+                if (isMobilitySlot && selected != null && !IsMobilitySkill(selected))
+                {
+                    EditorGUILayout.HelpBox("Space slot only accepts mobility skills (Movement Command set).", MessageType.Warning);
+                    selected = slots[i].ActiveSkill;
+                }
+                slots[i].ActiveSkill = selected;
+
+                EditorGUILayout.LabelField("Supports");
+                for (var s = 0; s < slots[i].Supports.Count; s++)
+                {
+                    EditorGUILayout.BeginHorizontal();
+                    slots[i].Supports[s] = (SupportGem)EditorGUILayout.ObjectField(slots[i].Supports[s], typeof(SupportGem), false);
+                    if (GUILayout.Button("X", GUILayout.Width(24f)))
+                    {
+                        slots[i].Supports.RemoveAt(s);
+                        s--;
+                    }
+                    EditorGUILayout.EndHorizontal();
+                }
+
+                if (GUILayout.Button("Add Support"))
+                    slots[i].Supports.Add(null);
+
+                EditorGUILayout.EndVertical();
+            }
+            EditorGUILayout.EndScrollView();
+        }
+
+        private void EnsureSlotCount()
+        {
+            while (slots.Count < GemLoadoutConstants.TotalSlotCount)
+                slots.Add(new SlotState());
+            while (slots.Count > GemLoadoutConstants.TotalSlotCount)
+                slots.RemoveAt(slots.Count - 1);
+        }
+
+        private void RefreshGemDatabase()
+        {
+            activeById.Clear();
+            supportById.Clear();
+
+            var folders = new[] { "Assets" };
+            var active = AssetDatabase.FindAssets("t:ActiveSkillGem", folders)
+                .Select(guid => AssetDatabase.LoadAssetAtPath<ActiveSkillGem>(AssetDatabase.GUIDToAssetPath(guid)))
+                .Where(g => g != null)
+                .Distinct()
+                .OrderBy(g => string.IsNullOrWhiteSpace(g.SkillName) ? g.name : g.SkillName);
+
+            foreach (var gem in active)
+            {
+                var id = gem.StableSkillId;
+                if (id > 0 && !activeById.ContainsKey(id))
+                    activeById.Add(id, gem);
+            }
+
+            var support = AssetDatabase.FindAssets("t:SupportGem", folders)
+                .Select(guid => AssetDatabase.LoadAssetAtPath<SupportGem>(AssetDatabase.GUIDToAssetPath(guid)))
+                .Where(g => g != null)
+                .Distinct()
+                .OrderBy(g => string.IsNullOrWhiteSpace(g.DisplayName) ? g.name : g.DisplayName);
+
+            foreach (var gem in support)
+            {
+                var id = gem.StableSupportId;
+                if (id > 0 && !supportById.ContainsKey(id))
+                    supportById.Add(id, gem);
+            }
+        }
+
+        private void TryAutoBindBridge()
+        {
+            var bridges = Resources.FindObjectsOfTypeAll<GemLoadoutBridgeAuthoring>()
+                .Where(b => b != null && !EditorUtility.IsPersistent(b) && b.gameObject.scene.IsValid())
+                .ToList();
+
+            if (bridges.Count <= 0)
+            {
+                bridge = null;
+                return;
+            }
+
+            bridge = bridges
+                .OrderByDescending(b => IsPlayerStateScene(b.gameObject.scene))
+                .ThenBy(b => b.gameObject.scene.name)
+                .FirstOrDefault();
+        }
+
+        private bool PullFromBridge()
+        {
+            if (bridge == null)
+                return false;
+
+            EnsureSlotCount();
+            ClearSlots();
+
+            activeSlot = Mathf.Clamp(bridge.ActiveSlot, 0, GemLoadoutConstants.ActiveSlotCount - 1);
+            if (bridge.Slots == null)
+                return true;
+
+            for (var i = 0; i < bridge.Slots.Count; i++)
+            {
+                var source = bridge.Slots[i];
+                if (source == null)
+                    continue;
+
+                var slotIndex = Mathf.Clamp(source.SlotIndex >= 0 ? source.SlotIndex : i, 0, GemLoadoutConstants.MobilitySlotIndex);
+                var target = slots[slotIndex];
+                target.ActiveSkill = source.ActiveSkill;
+                target.Supports.Clear();
+                if (source.Supports == null)
+                    continue;
+
+                for (var s = 0; s < source.Supports.Count; s++)
+                {
+                    var support = source.Supports[s];
+                    if (support == null || target.Supports.Contains(support))
+                        continue;
+                    target.Supports.Add(support);
+                }
+            }
+
+            if (slots[GemLoadoutConstants.MobilitySlotIndex].ActiveSkill != null && !IsMobilitySkill(slots[GemLoadoutConstants.MobilitySlotIndex].ActiveSkill))
+                slots[GemLoadoutConstants.MobilitySlotIndex].ActiveSkill = null;
+
+            Repaint();
+            return true;
+        }
+
+        private bool PullFromRuntimePlayer()
+        {
+            if (!TryGetPlayerEntity(out var em, out var player))
+                return false;
+
+            EnsureSlotCount();
+            ClearSlots();
+
+            if (em.HasComponent<GemActiveSlot>(player))
+                activeSlot = Mathf.Clamp(em.GetComponentData<GemActiveSlot>(player).Value, 0, GemLoadoutConstants.ActiveSlotCount - 1);
+
+            if (em.HasBuffer<GemSpellSlot>(player))
+            {
+                var slotBuffer = em.GetBuffer<GemSpellSlot>(player, true);
+                for (var i = 0; i < slotBuffer.Length; i++)
+                {
+                    var slot = slotBuffer[i];
+                    var slotIndex = Mathf.Clamp(slot.SlotIndex, 0, GemLoadoutConstants.MobilitySlotIndex);
+                    if (activeById.TryGetValue(slot.ActiveSkillId, out var gem))
+                        slots[slotIndex].ActiveSkill = gem;
+                }
+            }
+
+            if (em.HasBuffer<GemSpellSupportLink>(player))
+            {
+                var supportBuffer = em.GetBuffer<GemSpellSupportLink>(player, true);
+                for (var i = 0; i < supportBuffer.Length; i++)
+                {
+                    var link = supportBuffer[i];
+                    var slotIndex = Mathf.Clamp(link.SlotIndex, 0, GemLoadoutConstants.MobilitySlotIndex);
+                    if (!supportById.TryGetValue(link.SupportId, out var support))
+                        continue;
+                    if (!slots[slotIndex].Supports.Contains(support))
+                        slots[slotIndex].Supports.Add(support);
+                }
+            }
+
+            if (slots[GemLoadoutConstants.MobilitySlotIndex].ActiveSkill != null && !IsMobilitySkill(slots[GemLoadoutConstants.MobilitySlotIndex].ActiveSkill))
+                slots[GemLoadoutConstants.MobilitySlotIndex].ActiveSkill = null;
+
+            Repaint();
+            return true;
+        }
+
+        private void ApplyToBridge()
+        {
+            if (bridge == null)
+                CreateBridgeInActiveScene();
+            if (bridge == null)
+                return;
+
+            Undo.RecordObject(bridge, "Apply Gem Loadout To Bridge");
+            bridge.ActiveSlot = Mathf.Clamp(activeSlot, 0, GemLoadoutConstants.ActiveSlotCount - 1);
+            bridge.Slots = new List<GemLoadoutSlotAuthoring>();
+
+            for (var i = 0; i < slots.Count; i++)
+            {
+                var source = slots[i];
+                if (source.ActiveSkill == null)
+                    continue;
+                if (i == GemLoadoutConstants.MobilitySlotIndex && !IsMobilitySkill(source.ActiveSkill))
+                    continue;
+
+                var authored = new GemLoadoutSlotAuthoring
+                {
+                    SlotIndex = i,
+                    ActiveSkill = source.ActiveSkill,
+                    Supports = source.Supports.Where(s => s != null).Distinct().ToList()
+                };
+                bridge.Slots.Add(authored);
+            }
+
+            EditorUtility.SetDirty(bridge);
+            if (bridge.gameObject.scene.IsValid())
+                EditorSceneManager.MarkSceneDirty(bridge.gameObject.scene);
+        }
+
+        private void ApplyToRuntimePlayer()
+        {
+            if (!TryGetPlayerEntity(out var em, out var player))
+                return;
+
+            if (!em.HasComponent<GemActiveSlot>(player))
+                em.AddComponentData(player, new GemActiveSlot { Value = 0 });
+            if (!em.HasBuffer<GemSpellSlot>(player))
+                em.AddBuffer<GemSpellSlot>(player);
+            if (!em.HasBuffer<GemSpellSupportLink>(player))
+                em.AddBuffer<GemSpellSupportLink>(player);
+
+            var slotBuffer = em.GetBuffer<GemSpellSlot>(player);
+            var supportBuffer = em.GetBuffer<GemSpellSupportLink>(player);
+            slotBuffer.Clear();
+            supportBuffer.Clear();
+
+            for (var i = 0; i < slots.Count; i++)
+            {
+                var active = slots[i].ActiveSkill;
+                if (active == null)
+                    continue;
+                if (i == GemLoadoutConstants.MobilitySlotIndex && !IsMobilitySkill(active))
+                    continue;
+
+                var skillId = active.StableSkillId;
+                if (skillId <= 0)
+                    continue;
+
+                slotBuffer.Add(new GemSpellSlot
+                {
+                    SlotIndex = i,
+                    ActiveSkillId = skillId
+                });
+
+                for (var s = 0; s < slots[i].Supports.Count; s++)
+                {
+                    var support = slots[i].Supports[s];
+                    if (support == null)
+                        continue;
+
+                    var supportId = support.StableSupportId;
+                    if (supportId <= 0)
+                        continue;
+
+                    supportBuffer.Add(new GemSpellSupportLink
+                    {
+                        SlotIndex = i,
+                        SupportId = supportId
+                    });
+                }
+            }
+
+            var activeData = em.GetComponentData<GemActiveSlot>(player);
+            activeData.Value = Mathf.Clamp(activeSlot, 0, GemLoadoutConstants.ActiveSlotCount - 1);
+            em.SetComponentData(player, activeData);
+        }
+
+        private void CreateBridgeInActiveScene()
+        {
+            var scene = TryGetPreferredPlayerScene();
+            if (!scene.IsValid() || !scene.isLoaded)
+                return;
+
+            var go = new GameObject("Gem Loadout Bridge");
+            SceneManager.MoveGameObjectToScene(go, scene);
+            bridge = go.AddComponent<GemLoadoutBridgeAuthoring>();
+            Selection.activeObject = go;
+            ApplyToBridge();
+        }
+
+        private static Scene TryGetPreferredPlayerScene()
+        {
+            for (var i = 0; i < SceneManager.sceneCount; i++)
+            {
+                var scene = SceneManager.GetSceneAt(i);
+                if (!scene.IsValid() || !scene.isLoaded)
+                    continue;
+
+                if (IsPlayerStateScene(scene))
+                    return scene;
+            }
+
+            return SceneManager.GetActiveScene();
+        }
+
+        private static bool IsPlayerStateScene(Scene scene)
+        {
+            if (!scene.IsValid())
+                return false;
+
+            var path = scene.path ?? string.Empty;
+            if (path.IndexOf(".Player", StringComparison.OrdinalIgnoreCase) >= 0)
+                return true;
+
+            return scene.name.IndexOf("Player", StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
+        private static bool TryGetPlayerEntity(out EntityManager em, out Entity player)
+        {
+            em = default;
+            player = Entity.Null;
+            var world = Unity.Entities.World.DefaultGameObjectInjectionWorld;
+            if (world == null || !world.IsCreated)
+                return false;
+
+            em = world.EntityManager;
+            using var query = em.CreateEntityQuery(ComponentType.ReadOnly<PlayerTag>());
+            using NativeArray<Entity> entities = query.ToEntityArray(Allocator.Temp);
+            if (entities.Length <= 0)
+                return false;
+
+            player = entities[0];
+            return em.Exists(player);
+        }
+
+        private static bool IsMobilitySkill(ActiveSkillGem gem)
+        {
+            return gem != null && gem.MovementCommandType != MovementAbilityCommandType.None;
+        }
+
+        private static string ResolveSkillLabel(ActiveSkillGem gem)
+        {
+            if (gem == null)
+                return "(none)";
+            return string.IsNullOrWhiteSpace(gem.SkillName) ? gem.name : gem.SkillName;
+        }
+
+        private void ClearSlots()
+        {
+            for (var i = 0; i < slots.Count; i++)
+            {
+                slots[i].ActiveSkill = null;
+                slots[i].Supports.Clear();
+            }
+        }
+    }
+}
+
