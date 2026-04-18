@@ -1300,6 +1300,10 @@ PrefabInstance:
       propertyPath: target
       value: 
       objectReference: {fileID: 1689768676}
+    - target: {fileID: 283400044, guid: b1cc94d26cd016d479aa5b522d88da0a, type: 3}
+      propertyPath: leftHandPositionWeight
+      value: 0
+      objectReference: {fileID: 0}
     - target: {fileID: 1885862585, guid: b1cc94d26cd016d479aa5b522d88da0a, type: 3}
       propertyPath: nav
       value: 

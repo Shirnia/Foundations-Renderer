@@ -21,9 +21,12 @@ Shader "Hidden/URP/Quantize"
             #pragma vertex Vert
             #pragma fragment Frag
 
+            TEXTURE2D(_PaletteLABTex);
+            SAMPLER(sampler_PaletteLABTex);
+            TEXTURE2D(_PaletteRGBTex);
+            SAMPLER(sampler_PaletteRGBTex);
+
             CBUFFER_START(UnityPerMaterial)
-                float4 _PaletteLAB[256];
-                float4 _PaletteRGB[256];
                 int _PaletteSize;
             CBUFFER_END
 
@@ -57,6 +60,13 @@ Shader "Hidden/URP/Quantize"
             {
                 UNITY_SETUP_STEREO_EYE_INDEX_POST_VERTEX(input);
                 float4 col = SAMPLE_TEXTURE2D_X(_BlitTexture, sampler_LinearClamp, input.texcoord);
+
+                if (_PaletteSize <= 0)
+                {
+                    return col;
+                }
+
+                float invPaletteSize = rcp((float)_PaletteSize);
                 
                 float3 labCol = RGB_to_LAB(col.rgb);
 
@@ -66,7 +76,8 @@ Shader "Hidden/URP/Quantize"
                 [loop]
                 for(int j = 0; j < _PaletteSize; j++)
                 {
-                    float3 labPaletteColor = _PaletteLAB[j].rgb;
+                    float2 paletteUv = float2((j + 0.5) * invPaletteSize, 0.5);
+                    float3 labPaletteColor = SAMPLE_TEXTURE2D_LOD(_PaletteLABTex, sampler_PaletteLABTex, paletteUv, 0).rgb;
                     float3 diff = labCol - labPaletteColor;
                     float distSq = dot(diff, diff);
 
@@ -76,8 +87,11 @@ Shader "Hidden/URP/Quantize"
                         closestIndex = j;
                     }
                 }
+
+                float2 closestUv = float2((closestIndex + 0.5) * invPaletteSize, 0.5);
+                float3 closestRgb = SAMPLE_TEXTURE2D_LOD(_PaletteRGBTex, sampler_PaletteRGBTex, closestUv, 0).rgb;
                 
-                return half4(_PaletteRGB[closestIndex].rgb, 1.0);
+                return half4(closestRgb, 1.0);
             }
             ENDHLSL
         }

@@ -38,8 +38,10 @@ Shader "Custom/PixelateReactiveUnlit"
             CBUFFER_END
 
             // Global variables provided by the PixelateFeature script
-            float4 _PaletteLAB[256];
-            float4 _PaletteRGB[256];
+            TEXTURE2D(_PaletteLABTex);
+            SAMPLER(sampler_PaletteLABTex);
+            TEXTURE2D(_PaletteRGBTex);
+            SAMPLER(sampler_PaletteRGBTex);
             int _PaletteSize;
             float _PixelateEnabled;
 
@@ -88,11 +90,13 @@ Shader "Custom/PixelateReactiveUnlit"
                     float3 labCol = RGB_to_LAB(col.rgb);
                     float minDistanceSq = 1e10;
                     int closestIndex = 0;
+                    float invPaletteSize = rcp((float)_PaletteSize);
 
                     [loop]
                     for(int j = 0; j < _PaletteSize; j++)
                     {
-                        float3 labPaletteColor = _PaletteLAB[j].rgb;
+                        float2 paletteUv = float2((j + 0.5) * invPaletteSize, 0.5);
+                        float3 labPaletteColor = SAMPLE_TEXTURE2D_LOD(_PaletteLABTex, sampler_PaletteLABTex, paletteUv, 0).rgb;
                         float3 diff = labCol - labPaletteColor;
                         float distSq = dot(diff, diff);
 
@@ -102,7 +106,10 @@ Shader "Custom/PixelateReactiveUnlit"
                             closestIndex = j;
                         }
                     }
-                    return half4(_PaletteRGB[closestIndex].rgb, col.a);
+
+                    float2 closestUv = float2((closestIndex + 0.5) * invPaletteSize, 0.5);
+                    float3 closestRgb = SAMPLE_TEXTURE2D_LOD(_PaletteRGBTex, sampler_PaletteRGBTex, closestUv, 0).rgb;
+                    return half4(closestRgb, col.a);
                 }
                 
                 return col;
