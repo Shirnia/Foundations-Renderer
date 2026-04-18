@@ -1,4 +1,6 @@
 
+using System.Collections.Generic;
+using System.Reflection;
 using UnityEngine;
 using UnityEngine.Rendering;
 using UnityEngine.Rendering.Universal;
@@ -10,8 +12,43 @@ public class PixelateFeature : ScriptableRendererFeature
     [System.Serializable]
     public class PixelateSettings
     {
+        private static readonly Color[] DefaultUnityPalette = BuildDefaultUnityPalette();
+
         public int screenHeight = 144;
-        public Color[] palette = new Color[] { Color.black, Color.white };
+        public Color[] palette = (Color[])DefaultUnityPalette.Clone();
+
+        public void EnsurePaletteHasUnityDefaults()
+        {
+            if (palette == null || palette.Length < 60)
+            {
+                palette = (Color[])DefaultUnityPalette.Clone();
+            }
+        }
+
+        private static Color[] BuildDefaultUnityPalette()
+        {
+            var colorProperties = new List<PropertyInfo>();
+            var properties = typeof(Color).GetProperties(BindingFlags.Public | BindingFlags.Static);
+
+            for (int i = 0; i < properties.Length; i++)
+            {
+                var property = properties[i];
+                if (property.PropertyType == typeof(Color) && property.GetIndexParameters().Length == 0)
+                {
+                    colorProperties.Add(property);
+                }
+            }
+
+            colorProperties.Sort((a, b) => string.CompareOrdinal(a.Name, b.Name));
+
+            var palette = new Color[colorProperties.Count];
+            for (int i = 0; i < colorProperties.Count; i++)
+            {
+                palette[i] = (Color)colorProperties[i].GetValue(null, null);
+            }
+
+            return palette;
+        }
     }
 
     public PixelateSettings settings = new PixelateSettings();
@@ -22,8 +59,23 @@ public class PixelateFeature : ScriptableRendererFeature
     public override void Create()
     {
         Instance = this;
+        if (settings == null)
+        {
+            settings = new PixelateSettings();
+        }
+        settings.EnsurePaletteHasUnityDefaults();
         material = CoreUtils.CreateEngineMaterial(SHADER_NAME);
         pixelatePass = new PixelatePass(material);
+    }
+
+    private void OnValidate()
+    {
+        if (settings == null)
+        {
+            settings = new PixelateSettings();
+        }
+
+        settings.EnsurePaletteHasUnityDefaults();
     }
 
     public override void AddRenderPasses(ScriptableRenderer renderer, ref RenderingData renderingData)

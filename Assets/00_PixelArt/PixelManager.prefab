@@ -45,5 +45,5 @@ MonoBehaviour:
   m_Name: 
   m_EditorClassIdentifier: Assembly-CSharp::PixelateController
   effectActive: 1
-  screenHeight: 221
+  screenHeight: 1080
   palette: []
